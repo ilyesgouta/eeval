@@ -1,0 +1,566 @@
+
+/* Expression Evaluation Library, (C) Ilyes Gouta, 2007-2008. */
+
+%{
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include <assert.h>
+
+#define YYSTYPE_IS_DECLARED
+#include <eevaltype.h>
+
+#define YYPARSE_PARAM ctx
+
+#include <tokenizer.h>
+#include <eevalint.h>
+
+#define YYLEX_PARAM &(((eevalctx*)ctx)->yylval), ((eevalctx*)ctx)->scanner
+#define LEXTOKEN ((astnode*)yyget_lval(((eevalctx*)ctx)->scanner))
+
+static void enter_block(eevalctx* pctx);
+static void exit_block(eevalctx* pctx);
+
+EEVAL_ERROR push_node(eevalctx* pctx, astnode* node);
+astnode* pop_node(eevalctx* pctx);
+astnode* peek_node(eevalctx* pctx);
+
+static EEVAL_ERROR push_unary(eevalctx* pctx, UNARYOP op);
+static EEVAL_ERROR push_binary(eevalctx* pctx, BINARYOP op);
+static EEVAL_ERROR push_const_int(eevalctx* pctx, astnode* node);
+static EEVAL_ERROR push_const_float(eevalctx* pctx, astnode* node);
+static EEVAL_ERROR push_identifier(eevalctx* pctx, astnode* node);
+static EEVAL_ERROR push_array_identifier(eevalctx* pctx, astnode* node);
+static EEVAL_ERROR push_index(eevalctx* pctx, astnode* node);
+static EEVAL_ERROR push_array(eevalctx* pctx, astnode* node, int fetch);
+static EEVAL_ERROR push_string(eevalctx* pctx, astnode* node);
+static EEVAL_ERROR push_cjmp(eevalctx* pctx);
+static EEVAL_ERROR push_while_loop(eevalctx* pctx);
+
+static void reduce_nodes(eevalctx* pctx);
+
+#define CHECK_RESULT(a)          \
+    EEVAL_ERROR result = (a);    \
+    if (result != EEVAL_NOERROR) \
+        return (result);
+
+%}
+
+/* Bison declarations. */
+
+%token IDENTIFIER
+
+%token IF
+%token ELSE
+
+%token FOR
+%token WHILE
+%token DO
+
+%token CONSTINT
+%token CONSTFLOAT
+
+%token INTDECL
+%token FLOATDECL
+
+%token MAIN
+%token MINUSTOKEN
+
+%token TEXT
+%token PRINT
+
+%token LOR
+%token LAND
+
+%left '!' '^' '|' '&' '~'
+
+%left EQ NE LT GT LE GE
+%left '+' '-'
+%left '*' '/'
+
+%%
+
+input:
+    declarations functions
+;
+
+functions:
+    | functions function
+;
+
+function:
+    MAIN '(' { ((eevalctx*)ctx)->args_count = 0; } optional_arguments ')' block
+;
+
+optional_arguments:
+    | arguments
+;
+
+arguments:
+    argument
+    | arguments ',' argument
+;
+
+argument:
+    simpletype_decl IDENTIFIER                 { CHECK_RESULT(declare((eevalctx*)ctx, LEXTOKEN->id->name, ((eevalctx*)ctx)->decl_type, 1)); }
+    | simpletype_decl arrayid_decl array_decl  { CHECK_RESULT(declare_array((eevalctx*)ctx, ((eevalctx*)ctx)->decl_type, 1)); }
+;
+
+block:
+    '{' { enter_block((eevalctx*)ctx); } declarations statements '}' { exit_block((eevalctx*)ctx); }
+;
+
+declarations:
+    | declarations declaration
+;
+
+statements:
+    | statements statement
+;
+
+arrayid_decl:
+    IDENTIFIER                        { CHECK_RESULT(push_string((eevalctx*)ctx, LEXTOKEN)); }
+;
+
+array_component:
+    '[' CONSTINT ']'                  { CHECK_RESULT(adeclare_cmpt((eevalctx*)ctx, LEXTOKEN->id->value.ivalue)); }
+;
+
+array_decl:
+    array_component
+    | array_decl array_component
+;
+
+simpletype_decl:
+    INTDECL     { ((eevalctx*)ctx)->decl_type = INT_TYPE; }
+    | FLOATDECL { ((eevalctx*)ctx)->decl_type = FLOAT_TYPE; }
+;
+
+multi_declaration_cmpt:
+    IDENTIFIER                               { CHECK_RESULT(declare((eevalctx*)ctx, LEXTOKEN->id->name, ((eevalctx*)ctx)->decl_type, 0)); }
+    | multi_declaration_cmpt ',' IDENTIFIER  { CHECK_RESULT(declare((eevalctx*)ctx, LEXTOKEN->id->name, ((eevalctx*)ctx)->decl_type, 0)); }
+;
+
+declaration:
+    simpletype_decl multi_declaration_cmpt ';'
+    | simpletype_decl arrayid_decl array_decl ';' { CHECK_RESULT(declare_array((eevalctx*)ctx, ((eevalctx*)ctx)->decl_type, 0)); }
+;
+
+array_id:
+    IDENTIFIER                        { CHECK_RESULT(push_array_identifier((eevalctx*)ctx, LEXTOKEN)); }
+;
+
+array_indirection_cmpt:
+    '[' expr ']'                      { CHECK_RESULT(push_index((eevalctx*)ctx, LEXTOKEN)); }
+;
+
+array_indirection:
+    array_indirection_cmpt
+    | array_indirection array_indirection_cmpt
+;
+
+unary_expr:
+    CONSTINT                          { CHECK_RESULT(push_const_int((eevalctx*)ctx, LEXTOKEN)); }
+    | CONSTFLOAT                      { CHECK_RESULT(push_const_float((eevalctx*)ctx, LEXTOKEN)); }
+    | array_id array_indirection      { CHECK_RESULT(push_array((eevalctx*)ctx, LEXTOKEN, 1)); }
+    | IDENTIFIER                      { CHECK_RESULT(push_identifier((eevalctx*)ctx, LEXTOKEN)); }
+    | '(' expr ')'
+;
+
+expr:
+    unary_expr
+    | expr '+' expr                   { CHECK_RESULT(push_binary((eevalctx*)ctx, ADD)); }
+    | expr '-' expr                   { CHECK_RESULT(push_binary((eevalctx*)ctx, SUB)); }
+    | expr '*' expr                   { CHECK_RESULT(push_binary((eevalctx*)ctx, MUL)); }
+    | expr '/' expr                   { CHECK_RESULT(push_binary((eevalctx*)ctx, DIV)); }
+    | expr EQ expr                    { CHECK_RESULT(push_binary((eevalctx*)ctx, CMPEQ)); }
+    | expr NE expr                    { CHECK_RESULT(push_binary((eevalctx*)ctx, CMPNE)); }
+    | expr LE expr                    { CHECK_RESULT(push_binary((eevalctx*)ctx, CMPLE)); }
+    | expr GE expr                    { CHECK_RESULT(push_binary((eevalctx*)ctx, CMPGE)); }
+    | expr '<' expr                   { CHECK_RESULT(push_binary((eevalctx*)ctx, CMPLT)); }
+    | expr '>' expr                   { CHECK_RESULT(push_binary((eevalctx*)ctx, CMPGT)); }
+    | expr '|' expr                   { CHECK_RESULT(push_binary((eevalctx*)ctx, ARITH_OR)); }
+    | expr '&' expr                   { CHECK_RESULT(push_binary((eevalctx*)ctx, ARITH_AND)); }
+    | expr '^' expr                   { CHECK_RESULT(push_binary((eevalctx*)ctx, XOR)); }
+    | expr LOR expr                   { CHECK_RESULT(push_binary((eevalctx*)ctx, LOGIC_OR)); }
+    | expr LAND expr                  { CHECK_RESULT(push_binary((eevalctx*)ctx, LOGIC_AND)); }
+    | '-' expr                        { CHECK_RESULT(push_unary((eevalctx*)ctx, MINUS)); }
+    | '~' expr                        { CHECK_RESULT(push_unary((eevalctx*)ctx, BITWISE_NOT)); }
+    | '!' expr                        { CHECK_RESULT(push_unary((eevalctx*)ctx, NOT)); }
+;
+
+assignment_id:
+    array_id array_indirection        { CHECK_RESULT(push_array((eevalctx*)ctx, LEXTOKEN, 0)); }
+    | IDENTIFIER                      { CHECK_RESULT(push_identifier((eevalctx*)ctx, LEXTOKEN)); }
+;
+
+assignment_cmpt:
+    assignment_id '=' expr                       { CHECK_RESULT(push_binary((eevalctx*)ctx, ASSIGN)); }
+;
+
+assignment_multiple:
+    assignment_cmpt                              { reduce_nodes((eevalctx*)ctx); }
+    | assignment_multiple ',' assignment_cmpt    { reduce_nodes((eevalctx*)ctx); }
+;
+
+assignment_stmt:
+    assignment_multiple ';'
+;
+
+if_stmt:
+    IF '(' expr ')' block             { CHECK_RESULT(push_cjmp((eevalctx*)ctx)); }
+;
+
+while_stmt:
+    WHILE '(' expr ')' block          { CHECK_RESULT(push_while_loop((eevalctx*)ctx)); }
+;
+
+statement:
+    assignment_stmt
+    | if_stmt                         { reduce_nodes((eevalctx*)ctx); }
+    | while_stmt                      { reduce_nodes((eevalctx*)ctx); }
+;
+
+%%
+
+EEVAL_ERROR push_node(eevalctx* pctx, astnode* node)
+{
+    assert(pctx->stack_ptr < (sizeof(pctx->ast_stack) / sizeof(astnode*)));
+    
+    if (pctx->stack_ptr >= (sizeof(pctx->ast_stack) / sizeof(astnode*)))
+        return EEVAL_STACK_EXHAUSTED;
+
+    pctx->ast_stack[pctx->stack_ptr++] = node;
+    return EEVAL_NOERROR;
+}
+
+astnode* pop_node(eevalctx* pctx)
+{
+    assert(pctx->stack_ptr > 0);
+    
+    if (pctx->stack_ptr <= 0)
+        return NULL;
+
+    return (pctx->ast_stack[--pctx->stack_ptr]);
+}
+
+astnode* peek_node(eevalctx* pctx)
+{
+    assert(pctx->stack_ptr > 0);
+
+    if (pctx->stack_ptr <= 0)
+        return NULL;
+
+    return (pctx->ast_stack[pctx->stack_ptr - 1]);
+}
+
+static void reduce_nodes(eevalctx* pctx)
+{
+    astnode* node1;
+    astnode* node2;
+    
+    assert(pctx->stack_ptr > 1);
+    
+    node1 = pop_node(pctx);
+    node2 = pop_node(pctx);
+    
+    if (node2->nodetype == BLOCK) {
+        assert(!node2->left);
+        
+        node2->left = node1;
+        node1->parent = node2;
+        
+        push_node(pctx, node2);
+        push_node(pctx, node1);
+    } else {
+        assert((node1->nodetype == BINARY) ||
+               (node1->nodetype == CJMP) ||
+               (node1->nodetype == BLOCK));
+           
+        assert((node2->nodetype == BINARY) ||
+               (node2->nodetype == CJMP));
+    
+        node2->list.next = node1;
+        node1->list.prev = node2;
+    
+        push_node(pctx, node1);
+    }
+}
+
+static void enter_block(eevalctx* pctx)
+{
+    astnode* node = new_astnode(pctx, BLOCK);
+    push_node(pctx, node);
+    
+    pctx->scope++;
+}
+
+static void exit_block(eevalctx* pctx)
+{
+    pctx->scope--;
+    assert(pctx->scope >= 0);
+}
+
+static EEVAL_ERROR push_const_int(eevalctx* pctx, astnode* lexnode)
+{
+    astnode* node = new_astconstnode(pctx, CONST_INT_TYPE, lexnode->id->value.ivalue);
+    
+    if (!node)
+        return EEVAL_NOMEM;
+
+    return (push_node(pctx, node));
+}
+
+static EEVAL_ERROR push_const_float(eevalctx* pctx, astnode* lexnode)
+{
+    astnode* node = new_astconstnode(pctx, CONST_FLOAT_TYPE, (double)(lexnode->id->value.fvalue));
+
+    if (!node)
+        return EEVAL_NOMEM;
+
+    return (push_node(pctx, node));
+}
+
+static EEVAL_ERROR push_string(eevalctx* pctx, astnode* lexnode)
+{
+    astnode* node = new_astnode(pctx, STRING);
+    char *buf = strndup(lexnode->id->name, sizeof(lexnode->id->name) - 1);
+    
+    if (!node || !buf)
+        return EEVAL_NOMEM;
+    
+    node->value.buffer = buf;
+    
+    return (push_node(pctx, node));
+}
+
+static EEVAL_ERROR push_identifier(eevalctx* pctx, astnode* lexnode)
+{
+    astnode* node = new_astnode(pctx, IDENT);
+    
+    if (!node)
+        return EEVAL_NOMEM;
+
+    node->id = lookup(pctx, lexnode->id->name);
+    assert(node->id);
+    
+    if (!node->id)
+        return EEVAL_UNRESOLVED_IDENTIFIER;
+    
+    return (push_node(pctx, node));
+}
+
+static EEVAL_ERROR push_array_identifier(eevalctx* pctx, astnode* lexnode)
+{
+    astnode* node = new_astnode(pctx, IDENT);
+    
+    if (!node)
+        return EEVAL_NOMEM;
+
+    node->id = lookup(pctx, lexnode->id->name);
+    assert(node->id);
+    
+    if (!node->id)
+        return EEVAL_UNRESOLVED_IDENTIFIER;
+    
+    assert((node->id->type == INT_PTR_TYPE) || (node->id->type == FLOAT_PTR_TYPE));
+    
+    if ((node->id->type != INT_PTR_TYPE) && (node->id->type != FLOAT_PTR_TYPE))
+        return EEVAL_INVALID_IDENTIFIER;
+    
+    return (push_node(pctx, node));
+}
+
+static EEVAL_ERROR push_index(eevalctx* pctx, astnode* lexnode)
+{
+    astnode* node = new_astnode(pctx, INDEX);
+    astnode* tmp;
+    
+    if (!node)
+        return EEVAL_NOMEM;
+    
+    tmp = pop_node(pctx);
+    
+    assert((tmp->nodetype != BLOCK) &&
+           (tmp->nodetype != CJMP));
+    
+    if ((tmp->nodetype == BLOCK) ||
+        (tmp->nodetype == CJMP))
+        return EEVAL_INVALID_UNARY;
+    
+    node->left = tmp;
+    
+    return (push_node(pctx, node));
+}
+
+static EEVAL_ERROR push_array(eevalctx* pctx, astnode* lexnode, int fetch)
+{
+    astnode *head = NULL, *tmp = NULL;
+    astnode* node = new_astnode(pctx, BINARY);
+    int i = 0;
+    
+    node->binaryop = fetch ? EXPR_FETCH : EXPR_STORE;
+    
+    while ((peek_node(pctx)->nodetype == INDEX) && (pctx->stack_ptr > 0)) {
+        astnode* inode = pop_node(pctx);
+        assert(inode->nodetype == INDEX);
+        
+        if (!head)
+            head = tmp = inode;
+        else {
+            tmp->list.next = inode;
+            tmp = inode;
+        }
+        
+        i++;
+    }
+
+    assert(pctx->stack_ptr > 0);
+    
+    if (pctx->stack_ptr == 0)
+        return (fetch ? EEVAL_INVALID_FETCH : EEVAL_INVALID_STORE);
+    
+    node->left = pop_node(pctx);
+    
+    if (!node->left)
+        return (fetch ? EEVAL_INVALID_FETCH : EEVAL_INVALID_STORE);
+    
+    assert((node->left->nodetype == IDENT) &&
+           ((node->left->id->type == INT_PTR_TYPE) || (node->left->id->type == FLOAT_PTR_TYPE)));
+    
+    if ((node->left->nodetype != IDENT) ||
+        ((node->left->id->type != INT_PTR_TYPE) && (node->left->id->type != FLOAT_PTR_TYPE)))
+        return (fetch ? EEVAL_INVALID_FETCH : EEVAL_INVALID_STORE);
+    
+    assert(node->left->id->indirections_count == i);
+    
+    if (node->left->id->indirections_count != i)
+        return (fetch ? EEVAL_INVALID_FETCH : EEVAL_INVALID_STORE);
+    
+    node->right = head;
+    
+    node->right->parent = node;
+    node->left->parent = node;
+
+    return (push_node(pctx, node));
+}
+
+static EEVAL_ERROR push_unary(eevalctx* pctx, UNARYOP op)
+{
+    astnode* node = new_astnode(pctx, UNARY);
+    
+    node->unaryop = op;
+    
+    node->left = pop_node(pctx);
+    
+    if (!node->left)
+        return EEVAL_INVALID_UNARY;
+    
+    assert((node->left->nodetype != BLOCK) &&
+           (node->left->nodetype != CJMP));
+    
+    if ((node->left->nodetype == BLOCK) ||
+        (node->left->nodetype == CJMP))
+        return EEVAL_INVALID_UNARY;
+
+    node->left->parent = node;
+    
+    return (push_node(pctx, node));
+}
+
+static EEVAL_ERROR push_binary(eevalctx* pctx, BINARYOP op)
+{
+    astnode* node = new_astnode(pctx, BINARY);
+    
+    node->binaryop = op;
+    
+    node->right = pop_node(pctx);
+    node->left = pop_node(pctx);
+    
+    if (!node->right || !node->left)
+        return EEVAL_INVALID_BINARY;
+    
+    assert((node->right->nodetype != BLOCK) &&
+           (node->right->nodetype != CJMP));
+    
+    if ((node->right->nodetype == BLOCK) ||
+        (node->right->nodetype == CJMP))
+        return EEVAL_INVALID_BINARY;
+           
+    assert((node->left->nodetype != BLOCK) &&
+           (node->left->nodetype != CJMP));
+    
+    if ((node->left->nodetype == BLOCK) ||
+        (node->left->nodetype == CJMP))
+        return EEVAL_INVALID_BINARY;
+    
+    node->right->parent = node;
+    node->left->parent = node;
+    
+    return (push_node(pctx, node));
+}
+
+static EEVAL_ERROR push_cjmp(eevalctx* pctx)
+{
+    astnode* node = new_astnode(pctx, CJMP);
+    
+    node->right = pop_node(pctx);
+    node->left = pop_node(pctx);
+    
+    if (!node->right || !node->left)
+        return EEVAL_INVALID_CJMP;
+    
+    assert(node->right->nodetype == BLOCK);
+    
+    if (node->right->nodetype != BLOCK)
+        return EEVAL_INVALID_CJMP;
+    
+    assert((node->left->nodetype == UNARY) ||
+           (node->left->nodetype == IDENT) ||
+           (node->left->nodetype == BINARY));
+    
+    if ((node->left->nodetype != UNARY) &&
+        (node->left->nodetype != IDENT) &&
+        (node->left->nodetype != BINARY))
+        return EEVAL_INVALID_CJMP;
+
+    node->right->parent = node;
+    node->left->parent = node;
+
+    return (push_node(pctx, node));
+}
+
+static EEVAL_ERROR push_while_loop(eevalctx* pctx)
+{
+    astnode* node = new_astnode(pctx, CJMP);
+    astnode* node2 = new_astnode(pctx, JMP);
+    
+    if (peek_node(pctx)->nodetype != BLOCK)
+        pop_node(pctx);
+    
+    node->right = pop_node(pctx);
+    node->left = pop_node(pctx);
+    
+    if (!node->right || !node->left)
+        return EEVAL_INVALID_CJMP;
+    
+    assert(node->right->nodetype == BLOCK);
+    
+    if (node->right->nodetype != BLOCK)
+        return EEVAL_INVALID_CJMP;
+    
+    assert(node->left->nodetype == BINARY);
+    
+    if (node->left->nodetype != BINARY)
+        return EEVAL_INVALID_CJMP;
+    
+    node->right->parent = node;
+    node->left->parent = node;
+    
+    node2->left = node;
+    node2->parent = node->right;
+    
+    node->right->list.next = node2;
+        
+    return (push_node(pctx, node));
+}
